@@ -1,0 +1,406 @@
+---
+title: "Market Segmentation: K-means Clustering Algorithm" 
+subtitle: "Data Science for Marketing Series"
+author: "Nguyen Le Tung Lam"
+output:
+  html_document: 
+    code_download: true
+    #code_folding: hide
+    highlight: zenburn
+    # number_sections: yes
+    theme: "flatly"
+    toc: TRUE
+    toc_float: TRUE
+---
+
+```{r setup,include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+```
+
+
+
+
+# Method and Data Used
+
+K-means clustering algorithm will be used to conduct customer segmentation with rfm features.
+
+```{r}
+# Load library and read data: 
+rm(list = ls())
+library(tidyverse)
+library(magrittr)
+library(knitr)
+library(tidyverse)
+library(rfm)
+library(lubridate)
+library(hrbrthemes)
+library(data.table)
+library(caret)
+setwd('D:/DataR/Customer Segmentation Proj')
+
+
+df  <- fread('data_7.csv')
+
+
+```
+
+
+The dataset should be checked for NA value
+
+```{r}
+df %>% sapply(function(x) sum(is.na(x)))
+```
+
+About one third of monetary value is NA, this is due to the fact that not all transaction here require payment. We shall proceed to remove all NA value as well as negative value of trans_amount.
+
+```{r}
+# Data cleaning - remove NA and negative value: 
+df <- df[!(df$trans_amount %>% is.na),]
+df <- df[df$trans_amount> 0,]
+```
+
+We shall create one variable containing request_date in the POSIXct data type. After creating such value, more detailed date time value will be created for further analysis.
+
+```{r}
+df %>% 
+  mutate(time_ymd_hm = ymd_hms(request_date), 
+         time_hour = hour(time_ymd_hm), 
+         time_min = minute(time_ymd_hm), 
+         w_day = lubridate::wday(time_ymd_hm, label = TRUE, abbr = TRUE), 
+         time_mon = lubridate::month(time_ymd_hm, label = TRUE, abbr = TRUE), 
+         time_ymd = df$request_date %>% str_split(" ", simplify = TRUE) %>% data.frame() %>% pull(X1) %>% ymd) -> df
+```
+
+# Exploratory Data Analysis
+
+This step is conducted to discover any abnormaly and shall provide an overview about our dataset.
+
+
+
+
+```{r}
+library(hrbrthemes)
+theme_set(theme_ipsum())
+
+df %>% 
+  group_by(time_ymd_hm) %>% 
+  summarise(request_count = n()) %>% 
+  ungroup() -> req_byTime_hm
+
+req_byTime_hm %>% 
+  ggplot(aes(time_ymd_hm, request_count)) + 
+  geom_line() + 
+  labs(title = "Figure 1: Request count by Min", x = "Time", y = "Quantity")
+  
+```
+
+The request count appears to be higher in the middle of the day and lower in the end of the month. Yet in general, the request counts stay rather stable over the course of 31 days of July. However, there are some days in which the request count is exceptionally higher, we shall deal with this outlier later on. 
+
+```{r}
+df %>% 
+  group_by(time_ymd) %>% 
+  summarise(request_count = n()) %>% 
+  ungroup() -> req_byTime
+
+req_byTime %>% 
+  ggplot(aes(time_ymd, request_count)) + 
+  geom_line() + 
+  geom_point(color = "firebrick") + 
+  labs(title = "Figure 2: Request count by Day", x = "Time", y = "Quantity")
+
+```
+
+
+There are numerous process_code and their revenues are not equally distributed as shown in the graph below. 
+
+```{r}
+df %>% 
+  group_by(process_code) %>% 
+  summarise(sales = as.numeric(sum(trans_amount))) %>% 
+  ungroup() %>% 
+  arrange(-sales) %>% 
+  mutate(process_code = factor(process_code, levels = process_code)) %>% 
+  mutate(total = sum(sales)) %>% 
+  mutate(money_percent = sales / total) %>% 
+  mutate(cum_money = cumsum(money_percent)) -> moneySales_Item
+
+moneySales_Item %>% 
+  ggplot(aes(process_code, sales)) + 
+  geom_col() + 
+  theme(panel.grid.major.x = element_blank()) + 
+  theme(axis.text.x = element_blank()) + 
+  labs(title = "Figure 3: Revenue by process_code", x = "", y = "")
+  
+```
+
+Here we can see the 80-20 rule, 80% of revenue comes from 13% process code 
+
+```{r}
+moneySales_Item %>% 
+  filter(cum_money <= 0.8) -> top80_sales
+
+top80_sales %>% nrow() / nrow(moneySales_Item)
+```
+
+We can see the most profitable process code 
+
+```{r}
+moneySales_Item %>% 
+  select(-total) %>% 
+  head() %>% 
+  kable()
+```
+
+Using such insight, company can allocate more resources to take care for such process codes that generate the highest revenue
+
+# Customer Segments
+
+```{r}
+df <- data.table(df)
+```
+
+```{r}
+a <- df[,c('msisdn','trans_amount')][ , Recency:=sum(trans_amount), by = list(msisdn)][,-2] %>% unique()
+```
+
+Here the algorithm K-means clustering will be applied to segment customers by RFM features. The analysis time chosen will be 2019-07-31 to calculate recency. Choosing the time, however will not affect the output of the segmentation. 
+
+```{r}
+# The amount of time from the last time customer made a transaction till 2019-07-31 in days: 
+y <- as.duration(ymd_hms("2019-07-31 23:59:59") - df$time_ymd_hm) %>% as.numeric()
+y <- round(y / (3600*24), 0)
+
+# Create Recency variable: 
+df %>% mutate(recency = y) -> df
+
+df <- data.table(df)
+# Amount of money that a customer had spent, i.e. calculating Monetary: 
+df_money <- df[,c('msisdn','trans_amount')][ , Monetary:= as.numeric(sum(trans_amount)), by = list(msisdn)][,-2] %>% unique()
+# Calculating Recency: 
+df_recency <- df[,c('msisdn','recency')][ , Recency:= as.numeric(min(recency)), by = list(msisdn)][,-2] %>% unique()
+
+# Calculating Frequency: 
+df %>% 
+  group_by(msisdn) %>% 
+  count() %>% 
+  ungroup() %>% 
+  rename(freq = n) -> df_freq
+
+# The final data for analysis: 
+
+df_money %>% 
+  full_join(df_recency, by = "msisdn") %>% 
+  full_join(df_freq, by = "msisdn") %>% 
+  mutate(msisdn = as.character(msisdn)) -> final_df
+
+# Data overview: 
+final_df %>% 
+  head() %>% 
+  kable()
+
+```
+
+RFM features will be rescaled: 
+
+```{r}
+final_df %>% 
+  mutate_if(is.numeric, function(x) {(x - min(x)) / (max(x) - min(x))}) %>% 
+  select(-msisdn) -> final_df_scaled
+```
+
+K-means clustering requires choosing number of clusters. The optimal clusters can be selected based on numerous different method. Here we shall use Elbow Method
+
+
+```{r}
+set.seed(29)
+wss <- sapply(1:10, 
+              function(k){kmeans(final_df_scaled %>% sample_frac(0.2), 
+                                 k, nstart = 30)$tot.withinss})
+
+
+u <- data.frame(k = 1:10, WSS = wss)
+
+u %>% 
+  ggplot(aes(k, WSS)) + 
+  geom_line() + 
+  geom_point() + 
+  geom_point(data = u %>% filter(k == 3), color = "red", size = 3) + 
+  scale_x_continuous(breaks = seq(1, 10, by = 1)) + 
+  labs(title = "Figure 4: The Optimal Number of Clusters, Elbow Method", x = "Number of Clusters (K)") + 
+  theme(panel.grid.minor = element_blank())
+```
+
+From Figure 4, we can see that the optimal number of cluster is 4.
+
+```{r}
+# Cluster with k = 4: 
+set.seed(123)
+km.res <- kmeans(final_df_scaled, 4, nstart = 30)
+
+# Use the clustering result: 
+final_df %>% 
+  mutate(Group = km.res$cluster) %>% 
+  mutate(Group = paste("Group", Group)) -> final_df_clustered
+
+
+# Overview of customer by three features RFM: 
+final_df_clustered %>% 
+  group_by(Group) %>% 
+  summarise_each(funs(mean), Monetary, recency, freq) %>% 
+  ungroup() %>% 
+  mutate_if(is.numeric, function(x) {round(x, 0)}) %>% 
+  arrange(-Monetary) %>% 
+  kable()
+
+```
+
+Based on the result of clustering algorithm, customers can be divided into four different groups. Group 3 can be called VIP customers, who spent a enormous amount of money and use the service very often. Group 2 spent less money than group 3 and also use the service a little less often, hence can be considered loyal customers. Group 4 does not use the service often yet the revenue is still higher than group 1, this group can be customers who use our service little but spent a large amount of money, these are potential customers. The last group is the group who bring the least revenue.
+Yet before considereing using such insights for our business, we must be very careful since this algorithm is very sensitive with outliers. Even though we have rescaled, now we shall check for outliers.
+Here outliers will be defined as observations who are three time standard deviation over or below mean.
+
+```{r}
+# Outlier determine function: 
+outlier_label <- function(x) {
+  a <- mean(x)
+  b <- sd(x)
+  th1 <- a - 3*b
+  th2 <- a + 3*b
+  y <- case_when(x >= th1 & x <= th2 ~ "Normal", TRUE ~ "Outlier")
+  return(y)
+  
+}
+
+# Only normal observations will be used for K-means Clustering: 
+
+final_df %>% 
+  mutate(nor_money = outlier_label(Monetary), nor_freq = outlier_label(freq)) %>% 
+  filter(nor_money == "Normal", nor_freq == "Normal") %>% 
+  select(1:4) -> final_df_normal
+
+final_df_normal %>% 
+  mutate_if(is.numeric, function(x) {(x - min(x)) / (max(x) - min(x))}) -> final_df_normal_scaled
+
+```
+
+We shall redo K-means clustering
+
+
+```{r}
+set.seed(29)
+wss <- sapply(1:10, 
+              function(k){kmeans(final_df_normal_scaled %>% select(-msisdn) %>% sample_frac(0.2), 
+                                 k, nstart = 30)$tot.withinss})
+
+
+u <- data.frame(k = 1:10, WSS = wss)
+
+u %>% 
+  ggplot(aes(k, WSS)) + 
+  geom_line() + 
+  geom_point() + 
+  geom_point(data = u %>% filter(k == 4), color = "red", size = 3) + 
+  scale_x_continuous(breaks = seq(1, 10, by = 1)) + 
+  labs(title = "Figure 5: The Optimal Number of Clusters, Elbow Method", 
+       subtitle = "Outliers are are removed from sample.", 
+       x = "Number of Clusters (K)") + 
+  theme(panel.grid.minor = element_blank())
+```
+
+
+After removing outliers, we shall choose 4 number of clusters.
+
+
+```{r}
+# Phân cụm với k = 4: 
+set.seed(123)
+km.res4 <- kmeans(final_df_normal_scaled %>% select(-msisdn), 4, nstart = 30)
+
+# Sử dụng kết quả phân cụm: 
+final_df_normal %>% 
+  mutate(Group = km.res4$cluster) %>% 
+  mutate(Group = paste("Group", Group)) -> final_df_clustered
+
+```
+
+After removing outliers, customers will be clustered into 4 clusters with the following RFM features:
+```{r}
+# Chân dung của nhóm khách hàng được mô tả qua ba tiêu chí FRM: 
+final_df_clustered %>% 
+  group_by(Group) %>% 
+  summarise_each(funs(mean), Monetary, Recency, freq) %>% 
+  ungroup() %>% 
+  mutate_if(is.numeric, function(x) {round(x, 0)}) %>% 
+  arrange(-Monetary) %>% 
+  kable()
+```
+
+Here we shall calculate the weight of revenue from these groups. 
+
+```{r}
+final_df_clustered %>% 
+  group_by(Group) %>% 
+  summarise_each(funs(sum, mean, median, min, max, sd, n()), Monetary) %>% 
+  ungroup() %>% 
+  mutate(per_trans = round(100*sum / sum(sum), 2)) -> trans_group
+
+
+library(ggthemes)
+
+trans_group %>% 
+  ggplot(aes(reorder(Group, per_trans), per_trans, fill = Group, color = Group)) + 
+  geom_col(width = 0.5, show.legend = FALSE) + 
+  coord_flip() + 
+  geom_text(aes(label = paste(per_trans, paste0(paste0("(", "%")), ")")), 
+            hjust = -0.05, color = "white", size = 5) + 
+  scale_y_continuous(limits = c(0, 90), expand = c(0.01, 0)) + 
+  scale_fill_tableau() + 
+  scale_color_tableau() + 
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) + 
+  theme(panel.grid.major = element_blank()) + 
+  theme(panel.grid.minor = element_blank()) + 
+  labs(x = NULL, title = "Figure 6: Share of revenue by Customer Group")
+
+```
+
+
+Group 2 acounts for 40.5% total customers and bring 35.39% revenue for the company: 
+
+```{r}
+trans_group %>% 
+  select(Group, n) %>% 
+  mutate(total = sum(n)) %>% 
+  mutate(label = 100*n / total) %>% 
+  mutate(label = paste(round(label, 1), "%")) %>% 
+  ggplot(aes(Group, n, fill = Group, color = Group)) + 
+  geom_col(width = 0.5, show.legend = FALSE) + 
+  geom_text(aes(label = label), color = "white", vjust = 1.4, size = 5) + 
+  scale_fill_tableau() + 
+  scale_color_tableau() + 
+  theme(panel.grid.minor = element_blank()) + 
+  theme(panel.grid.major.x = element_blank()) + 
+  labs(x = NULL, y = NULL, title = "Figure 7: Number of Customers by Group")
+  
+```
+
+
+#Summary 
+Based on this findings, one can apply many different strategy for these different customers group. One can even use these findings as labelling to predict the position of customers in groups and from there applying appropriate treatment. By and large, these methods have a large range of applications.
+
+
+
+
+
+# References
+
+1. Chapman, C., & Feit, E. M. (2019). R for marketing research and analytics. New York, NY: Springer.
+2. Chen, D., Sain, S. L., & Guo, K. (2012). Data mining for the online retail industry: A case study of RFM model-based customer segmentation using data mining. Journal of Database Marketing & Customer Strategy Management, 19(3), 197-208.
+3. Khajvand, M., & Tarokh, M. J. (2011). Estimating customer future value of different customer segments based on adapted RFM model in retail banking context. Procedia Computer Science, 3, 1327-1332.
+4. Shmueli, G., Bruce, P. C., Yahav, I., Patel, N. R., & Lichtendahl Jr, K. C. (2017). Data mining for business analytics: concepts, techniques, and applications in R. John Wiley & Sons.
+5. Zakrzewska, D., & Murlewski, J. (2005, September). Clustering algorithms for bank customer segmentation. In 5th International Conference on Intelligent Systems Design and Applications (ISDA'05) (pp. 197-202). IEEE.
+
+
+
+
+
